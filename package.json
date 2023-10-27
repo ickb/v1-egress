@@ -12,10 +12,13 @@
     "@ckb-lumos/base": "^0.20.0",
     "@ckb-lumos/bi": "^0.20.0",
     "@ckb-lumos/config-manager": "^0.20.0",
+    "@ckb-lumos/helpers": "^0.20.0",
+    "@ckb-lumos/hd": "^0.20.0",
     "lumos-utils": "https://github.com/phroi/lumos-utils#bca4c3f",
-    "v1-core": "https://github.com/ickb/v1-core#c268b88"
+    "v1-core": "https://github.com/ickb/v1-core#d6cd88d"
   },
   "//": {
+    "v1-core": "file:/home/user/ickb/v1-core",
     "lumos-utils": "file:/home/user/lumos-utils"
   },
   "devDependencies": {
