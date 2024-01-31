@@ -1,5 +1,5 @@
 {
-  "name": "v1-bot",
+  "name": "@ickb/v1-bot",
   "version": "1.0.0",
   "description": "",
   "scripts": {
@@ -9,18 +9,16 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@ckb-lumos/base": "^0.20.0",
-    "@ckb-lumos/bi": "^0.20.0",
-    "@ckb-lumos/config-manager": "^0.20.0",
-    "@ckb-lumos/helpers": "^0.20.0",
-    "@ckb-lumos/hd": "^0.20.0",
-    "@ckb-lumos/ckb-indexer": "^0.20.0",
-    "lumos-utils": "phroi/lumos-utils",
-    "v1-core": "ickb/v1-core"
+    "@ckb-lumos/base": "^0.21.1",
+    "@ckb-lumos/bi": "^0.21.1",
+    "@ckb-lumos/config-manager": "^0.21.1",
+    "@ckb-lumos/helpers": "^0.21.1",
+    "@ckb-lumos/hd": "^0.21.1",
+    "@ickb/lumos-utils": "^1.0.0",
+    "@ickb/v1-core": "^1.0.0"
   },
   "devDependencies": {
-    "@types/node": "^20.4.4",
-    "ts-node": "^10.9.1",
-    "typescript": "^5.1.6"
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
   }
 }
