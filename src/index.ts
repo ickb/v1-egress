@@ -2,8 +2,7 @@ import config from "./config.json";
 import { Config } from "@ckb-lumos/config-manager";
 import { parseUnit } from "@ckb-lumos/bi";
 import {
-    Assets,
-    I8Cell, I8Header, I8Script, addCells, capacitiesSifter, ckbFundAdapter, errorNotEnoughFunds,
+    Assets, I8Cell, I8Header, I8Script, addCells, capacitiesSifter, ckbFundAdapter, errorNotEnoughFunds,
     fund, getCells, getHeaderByNumber, getTipHeader, initializeChainAdapter, isDaoDeposit,
     isDaoWithdrawalRequest, secp256k1Blake160, sendTransaction
 } from "@ickb/lumos-utils";
@@ -18,70 +17,78 @@ import { Cell, Hexadecimal, OutPoint } from "@ckb-lumos/base";
 
 async function main() {
     await initializeChainAdapter("devnet", config as Config);
-    const limitOrderInfo = limitOrder();
 
-    const botAccount = await createBot();
+    const testingBotKey = "0xd4a18c9653909588b71551a641a6fed44f2893c9a81f8b46998582a6c98fc5a0";
+    let botAccount = secp256k1Blake160(testingBotKey);
 
-    while (true) {
-        console.log("Zzzz...")
-        await new Promise(r => setTimeout(r, 10000));
-
-        const cells = [
-            ...await getCells({
-                script: botAccount.lockScript,
-                scriptType: "lock",
-                scriptSearchMode: "exact"
-            }),
-            ...await getCells({
-                script: ickbLogicScript(),
-                scriptType: "lock",
-                scriptSearchMode: "exact"
-            }),
-        ];
-
-        const { owned: capacities, unknowns } = capacitiesSifter(cells, botAccount.expander);
-        const { ickbGroups, sudts, ickbDeposits } = await myIckbSifter(unknowns, botAccount.expander);
-
-        const tipHeader = await getTipHeader();
-        // const feeRate = await getFeeRate();
-        const feeRate = 1000;
-
-        let assets = ckbFundAdapter(botAccount.lockScript, feeRate, botAccount.preSigner, capacities);
-        assets = ickbSudtFundAdapter(assets, botAccount.lockScript, sudts, tipHeader, ickbGroups);
-
-        const limitOrders = limitOrderInfo.sifter(await getCells({
-            script: limitOrderInfo.limitOrderLock,
+    const cells = [
+        ...await getCells({
+            script: botAccount.lockScript,
             scriptType: "lock",
-            scriptSearchMode: "prefix"
-        })).owned;
+            scriptSearchMode: "exact"
+        }),
+        ...await getCells({
+            script: ickbLogicScript(),
+            scriptType: "lock",
+            scriptSearchMode: "exact"
+        }),
+    ];
 
-        let tx = TransactionSkeleton();
-        let fundedTx = rebalanceAndFund(tx, assets, ickbDeposits, tipHeader);
-
-        for (const limitOrder of limitOrders) {
-            tx = limitOrderInfo.fulfill(tx, limitOrder, undefined, undefined);
-            //Re-balance holding between CKB and iCKB
-            let newFundedTx = rebalanceAndFund(tx, assets, ickbDeposits, tipHeader);
-            if (!newFundedTx) {
-                break
-            }
-            fundedTx = newFundedTx;
-        }
-        if (!fundedTx) {
-            continue
-        }
-
-        // console.log(JSON.stringify(fundedTx, undefined, 2));
-        console.log("CKB :", assets["CKB"].balance.div(100000000).toString());
-        console.log("ICKB:", assets["ICKB_SUDT"].balance.div(100000000).toString());
-        fundedTx.inputs.filter(limitOrderInfo.isValid).forEach(() => console.log("Limit Order Matched"));
-        fundedTx.outputs.filter(isDaoDeposit).forEach(() => console.log("Deposit"));
-        fundedTx.outputs.filter(isDaoWithdrawalRequest).forEach(() => console.log("Withdrawal Request"));
-        fundedTx.inputs.filter(isDaoWithdrawalRequest).forEach(() => console.log("Withdrawal"));
-
-        const txHash = await sendTransaction(botAccount.signer(fundedTx));
-        console.log(txHash);
+    if (cells.length === 0) {
+        botAccount = await createBot(testingBotKey);
+        return;
     }
+
+    const { owned: capacities, unknowns } = capacitiesSifter(cells, botAccount.expander);
+    const { ickbGroups, sudts, ickbDeposits } = await myIckbSifter(unknowns, botAccount.expander);
+
+    const tipHeader = await getTipHeader();
+    // const feeRate = await getFeeRate();
+    const feeRate = 1000;
+
+    let assets = ckbFundAdapter(botAccount.lockScript, feeRate, botAccount.preSigner, capacities);
+    assets = ickbSudtFundAdapter(assets, botAccount.lockScript, sudts, tipHeader, ickbGroups);
+
+    console.log("CKB :", assets["CKB"].balance.div(100000000).toString());
+    console.log("ICKB:", assets["ICKB_SUDT"].balance.div(100000000).toString());
+
+    const limitOrderInfo = limitOrder();
+    const limitOrders = await getLimitOrders(limitOrderInfo);
+
+    let tx = TransactionSkeleton();
+    let fundedTx = rebalanceAndFund(tx, assets, ickbDeposits, tipHeader);
+
+    for (const limitOrder of limitOrders) {
+        tx = limitOrderInfo.fulfill(tx, limitOrder, undefined, undefined);
+        //Re-balance holding between CKB and iCKB
+        let newFundedTx = rebalanceAndFund(tx, assets, ickbDeposits, tipHeader);
+        if (!newFundedTx) {
+            break
+        }
+        fundedTx = newFundedTx;
+    }
+    if (!fundedTx) {
+        return
+    }
+
+    // console.log(JSON.stringify(fundedTx, undefined, 2));
+    fundedTx.inputs.filter(limitOrderInfo.isValid).forEach(() => console.log("Limit Order Matched"));
+    fundedTx.outputs.filter(isDaoDeposit).forEach(() => console.log("Deposit"));
+    fundedTx.outputs.filter(isDaoWithdrawalRequest).forEach(() => console.log("Withdrawal Request"));
+    fundedTx.inputs.filter(isDaoWithdrawalRequest).forEach(() => console.log("Withdrawal"));
+
+    const txHash = await sendTransaction(botAccount.signer(fundedTx));
+    console.log(txHash);
+}
+
+async function getLimitOrders(limitOrderInfo: ReturnType<typeof limitOrder>) {
+    const limitOrders = limitOrderInfo.sifter(await getCells({
+        script: limitOrderInfo.limitOrderLock,
+        scriptType: "lock",
+        scriptSearchMode: "prefix"
+    })).owned;
+
+    return limitOrders;
 }
 
 function rebalanceAndFund(
@@ -175,7 +182,7 @@ async function myIckbSifter(inputs: readonly Cell[], accountLockExpander: (c: Ce
     }
 }
 
-async function createBot() {
+async function createBot(testingBotKey: string) {
     console.log("Funding bot");
     //Genesis devnet account
     const {
@@ -186,7 +193,6 @@ async function createBot() {
     } = secp256k1Blake160(
         "0xd00c06bfd800d27397002dca6fb0993d5ba6399b4238b2f29ee9deb97593d2bc"
     );
-
     const { owned: capacities } = capacitiesSifter(
         (await getCells({
             script: lockScript,
@@ -201,7 +207,7 @@ async function createBot() {
     );
 
     //Bot account
-    const botAccount = secp256k1Blake160();
+    const botAccount = secp256k1Blake160(testingBotKey);
     const cell = I8Cell.from({
         capacity: parseUnit("10000000", "ckb").toHexString(),// == max 50 deposits
         lock: botAccount.lockScript,
