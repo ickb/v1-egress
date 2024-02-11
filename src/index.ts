@@ -2,7 +2,7 @@ import config from "./config.json";
 import { Config } from "@ckb-lumos/config-manager";
 import { parseUnit } from "@ckb-lumos/bi";
 import {
-    Assets, I8Cell, I8Header, I8Script, addCells, capacitiesSifter, ckbFundAdapter, errorNotEnoughFunds,
+    Assets, I8Cell, I8Header, I8Script, addCells, capacitySifter, ckbFundAdapter, errorNotEnoughFunds,
     fund, getCells, getHeaderByNumber, getTipHeader, initializeChainAdapter, isDaoDeposit,
     isDaoWithdrawalRequest, secp256k1Blake160, sendTransaction
 } from "@ickb/lumos-utils";
@@ -20,48 +20,36 @@ async function main() {
 
     const testingBotKey = "0xd4a18c9653909588b71551a641a6fed44f2893c9a81f8b46998582a6c98fc5a0";
     let botAccount = secp256k1Blake160(testingBotKey);
+    const limitOrderInfo = limitOrder();
 
-    const cells = [
-        ...await getCells({
-            script: botAccount.lockScript,
-            scriptType: "lock",
-            scriptSearchMode: "exact"
-        }),
-        ...await getCells({
-            script: ickbLogicScript(),
-            scriptType: "lock",
-            scriptSearchMode: "exact"
-        }),
-    ];
+    const {
+        capacities,
+        sudts, receiptGroups, ickbDepositPool,
+        ckb2SudtOrders, sudt2ckbOrders
+    } = await siftCells(botAccount, limitOrderInfo);
 
-    if (cells.length === 0) {
+    if (capacities.length === 0 && sudts.length === 0) {
         botAccount = await createBot(testingBotKey);
         return;
     }
-
-    const { owned: capacities, unknowns } = capacitiesSifter(cells, botAccount.expander);
-    const { ickbGroups, sudts, ickbDeposits } = await myIckbSifter(unknowns, botAccount.expander);
 
     const tipHeader = await getTipHeader();
     // const feeRate = await getFeeRate();
     const feeRate = 1000;
 
     let assets = ckbFundAdapter(botAccount.lockScript, feeRate, botAccount.preSigner, capacities);
-    assets = ickbSudtFundAdapter(assets, botAccount.lockScript, sudts, tipHeader, ickbGroups);
+    assets = ickbSudtFundAdapter(assets, botAccount.lockScript, sudts, tipHeader, receiptGroups);
 
     console.log("CKB :", assets["CKB"].balance.div(100000000).toString());
     console.log("ICKB:", assets["ICKB_SUDT"].balance.div(100000000).toString());
 
-    const limitOrderInfo = limitOrder();
-    const limitOrders = await getLimitOrders(limitOrderInfo);
-
     let tx = TransactionSkeleton();
-    let fundedTx = rebalanceAndFund(tx, assets, ickbDeposits, tipHeader);
+    let fundedTx = rebalanceAndFund(tx, assets, ickbDepositPool, tipHeader);
 
-    for (const limitOrder of limitOrders) {
+    for (const limitOrder of [...ckb2SudtOrders, ...sudt2ckbOrders]) {
         tx = limitOrderInfo.fulfill(tx, limitOrder, undefined, undefined);
         //Re-balance holding between CKB and iCKB
-        let newFundedTx = rebalanceAndFund(tx, assets, ickbDeposits, tipHeader);
+        let newFundedTx = rebalanceAndFund(tx, assets, ickbDepositPool, tipHeader);
         if (!newFundedTx) {
             break
         }
@@ -81,14 +69,42 @@ async function main() {
     console.log(txHash);
 }
 
-async function getLimitOrders(limitOrderInfo: ReturnType<typeof limitOrder>) {
-    const limitOrders = limitOrderInfo.sifter(await getCells({
-        script: limitOrderInfo.limitOrderLock,
-        scriptType: "lock",
-        scriptSearchMode: "prefix"
-    })).owned;
+async function siftCells(
+    botAccount: ReturnType<typeof secp256k1Blake160>,
+    limitOrderInfo: ReturnType<typeof limitOrder>
+) {
+    const cells = (await Promise.all([
+        getCells({
+            script: botAccount.lockScript,
+            scriptType: "lock",
+            scriptSearchMode: "exact"
+        }),
+        getCells({
+            script: ickbLogicScript(),
+            scriptType: "lock",
+            scriptSearchMode: "exact"
+        }),
+        getCells({
+            script: limitOrderInfo.limitOrderLock,
+            scriptType: "lock",
+            scriptSearchMode: "prefix"
+        })
+    ])).flat();
 
-    return limitOrders;
+    const { capacities, notCapacities } = capacitySifter(cells, botAccount.expander);
+    const {
+        sudts,
+        receiptGroups,
+        ickbDepositPool,
+        notIckbs
+    } = await myIckbSifter(notCapacities, botAccount.expander);
+    const { ckb2SudtOrders, sudt2ckbOrders } = limitOrderInfo.sifter(notIckbs);
+
+    return {
+        capacities,
+        sudts, receiptGroups, ickbDepositPool,
+        ckb2SudtOrders, sudt2ckbOrders
+    }
 }
 
 function rebalanceAndFund(
@@ -110,7 +126,7 @@ function rebalanceAndFund(
         )
     );
 
-    for (const [name, { availableBalance }] of Object.entries(a)) {
+    for (const [_, { availableBalance }] of Object.entries(a)) {
         if (availableBalance.lt(0)) {
             return undefined;
         }
@@ -123,8 +139,7 @@ function rebalanceAndFund(
         tx = ickbDeposit(tx, 1, tipHeader);
     } else if (ickbBalance.gt(ICKB_SOFT_CAP_PER_DEPOSIT.mul(3))) {
         const ickbExcess = ickbBalance.sub(ICKB_SOFT_CAP_PER_DEPOSIT.mul(2));
-        //One withdrawal request for each transaction
-        tx = ickbRequestWithdrawalWith(tx, ickbDepositPool, tipHeader, ickbExcess, 1);
+        tx = ickbRequestWithdrawalWith(tx, ickbDepositPool, tipHeader, ickbExcess);
     }
 
     if (tx.outputs.size === 0) {
@@ -193,7 +208,7 @@ async function createBot(testingBotKey: string) {
     } = secp256k1Blake160(
         "0xd00c06bfd800d27397002dca6fb0993d5ba6399b4238b2f29ee9deb97593d2bc"
     );
-    const { owned: capacities } = capacitiesSifter(
+    const { capacities } = capacitySifter(
         (await getCells({
             script: lockScript,
             scriptType: "lock",
