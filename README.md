@@ -35,7 +35,7 @@ cd src && ln -s /home/user/ickb/v1-core/config.json config.json && cd ..
 7. Start simulation of matching user limit orders:
 
 ```bash
-watch -n 0 npm run matchOrder
+watch -n 0 npm run matchOrder devnet
 ```
 
 ## Complete Setup

@@ -2,9 +2,9 @@ import config from "./config.json";
 import { Config } from "@ckb-lumos/config-manager";
 import { parseUnit } from "@ckb-lumos/bi";
 import {
-    Assets, I8Cell, I8Header, I8Script, addCells, capacitySifter, ckbFundAdapter, errorNotEnoughFunds,
-    fund, getCells, getHeaderByNumber, getTipHeader, initializeChainAdapter, isDaoDeposit,
-    isDaoWithdrawalRequest, secp256k1Blake160, sendTransaction
+    Assets, I8Cell, I8Header, I8Script, capacitySifter, ckbFundAdapter, errorNotEnoughFunds,
+    fund, genesisDevnetKey, getCells, getFeeRate, getHeaderByNumber, getTipHeader, initializeChainAdapter,
+    isChain, isDaoDeposit, isDaoWithdrawalRequest, secp256k1Blake160, sendTransaction, shuffle
 } from "@ickb/lumos-utils";
 import {
     ICKB_SOFT_CAP_PER_DEPOSIT, ickbDeposit, ickbLogicScript, ickbRequestWithdrawalWith, ickbSifter,
@@ -13,10 +13,23 @@ import {
 import { TransactionSkeleton, TransactionSkeletonType } from "@ckb-lumos/helpers";
 import { Cell, Hexadecimal, OutPoint } from "@ckb-lumos/base";
 
-//ADD some check to check initial bot capital
+//ADD some checks for initial bot capital
 
 async function main() {
-    await initializeChainAdapter("devnet", config as Config);
+    const args = process.argv.slice(2);
+    const [chain, rpcUrl, clientType] = args;
+
+    if (args.length < 1 || args.length > 3
+        || !isChain(chain)
+        || !(clientType in clientType2IsLightClient)) {
+        throw Error("Invalid command line arguments " + args.join(" "));
+    }
+
+    await initializeChainAdapter(chain, config as Config, rpcUrl, clientType2IsLightClient[clientType]);
+
+    if (chain === "mainnet") {
+        throw Error("Not yet ready for mainnet...")
+    }
 
     const testingBotKey = "0xd4a18c9653909588b71551a641a6fed44f2893c9a81f8b46998582a6c98fc5a0";
     let botAccount = secp256k1Blake160(testingBotKey);
@@ -29,13 +42,15 @@ async function main() {
     } = await siftCells(botAccount, limitOrderInfo);
 
     if (capacities.length === 0 && sudts.length === 0) {
-        botAccount = await createBot(testingBotKey);
+        console.log("Funding bot");
+        const genesisAccount = secp256k1Blake160(genesisDevnetKey);
+        const txHash = await genesisAccount.transfer(botAccount.lockScript, parseUnit("1000000", "ckb"));
+        console.log(txHash);
         return;
     }
 
     const tipHeader = await getTipHeader();
-    // const feeRate = await getFeeRate();
-    const feeRate = 1000;
+    const feeRate = await getFeeRate();
 
     let assets = ckbFundAdapter(botAccount.lockScript, feeRate, botAccount.preSigner, capacities);
     assets = ickbSudtFundAdapter(assets, botAccount.lockScript, sudts, tipHeader, receiptGroups);
@@ -46,8 +61,8 @@ async function main() {
     let tx = TransactionSkeleton();
     let fundedTx = rebalanceAndFund(tx, assets, ickbDepositPool, tipHeader);
 
-    for (const limitOrder of [...ckb2SudtOrders, ...sudt2ckbOrders]) {
-        tx = limitOrderInfo.fulfill(tx, limitOrder, undefined, undefined);
+    for (const order of shuffle([...ckb2SudtOrders, ...sudt2ckbOrders])) {
+        tx = limitOrderInfo.fulfill(tx, order, undefined, undefined);
         //Re-balance holding between CKB and iCKB
         let newFundedTx = rebalanceAndFund(tx, assets, ickbDepositPool, tipHeader);
         if (!newFundedTx) {
@@ -197,47 +212,10 @@ async function myIckbSifter(inputs: readonly Cell[], accountLockExpander: (c: Ce
     }
 }
 
-async function createBot(testingBotKey: string) {
-    console.log("Funding bot");
-    //Genesis devnet account
-    const {
-        lockScript,
-        expander,
-        preSigner,
-        signer
-    } = secp256k1Blake160(
-        "0xd00c06bfd800d27397002dca6fb0993d5ba6399b4238b2f29ee9deb97593d2bc"
-    );
-    const { capacities } = capacitySifter(
-        (await getCells({
-            script: lockScript,
-            scriptType: "lock",
-            filter: {
-                scriptLenRange: ["0x0", "0x1"],
-                outputDataLenRange: ["0x0", "0x1"],
-            },
-            scriptSearchMode: "exact"
-        })),
-        expander
-    );
-
-    //Bot account
-    const botAccount = secp256k1Blake160(testingBotKey);
-    const cell = I8Cell.from({
-        capacity: parseUnit("10000000", "ckb").toHexString(),// == max 50 deposits
-        lock: botAccount.lockScript,
-    });
-
-    let tx = TransactionSkeleton();
-    tx = addCells(tx, "append", [], [cell]);
-    // const feeRate = await getFeeRate();
-    const feeRate = 1000;
-    tx = fund(tx, ckbFundAdapter(lockScript, feeRate, preSigner, capacities));
-    const txHash = await sendTransaction(signer(tx));
-
-    console.log(txHash);
-
-    return botAccount;
-}
+const clientType2IsLightClient: { [id: string]: boolean } = {
+    "light": true,
+    "full": false,
+    undefined: false
+};
 
 main();
