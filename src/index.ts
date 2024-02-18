@@ -1,17 +1,18 @@
 import config from "./config.json";
 import { Config } from "@ckb-lumos/config-manager";
-import { parseUnit } from "@ckb-lumos/bi";
+import { BI, parseUnit } from "@ckb-lumos/bi";
 import {
-    Assets, I8Cell, I8Header, I8Script, capacitySifter, ckbFundAdapter, errorNotEnoughFunds,
-    fund, genesisDevnetKey, getCells, getFeeRate, getHeaderByNumber, getTipHeader, initializeChainAdapter,
-    isChain, isDaoDeposit, isDaoWithdrawalRequest, secp256k1Blake160, sendTransaction, shuffle
+    Assets, I8Cell, I8Header, I8Script, addCells, capacitySifter, ckbDelta, ckbFundAdapter, errorNotEnoughFunds,
+    errorTooManyOutputs, fund, genesisDevnetKey, getCells, getFeeRate, getHeaderByNumber, getTipHeader,
+    initializeChainAdapter, isChain, isDaoDeposit, isDaoWithdrawalRequest, secp256k1Blake160, sendTransaction
 } from "@ickb/lumos-utils";
 import {
-    ICKB_SOFT_CAP_PER_DEPOSIT, ickbDeposit, ickbLogicScript, ickbRequestWithdrawalWith, ickbSifter,
-    ickbSudtFundAdapter, limitOrder
+    ICKB_SOFT_CAP_PER_DEPOSIT, LimitOrder, ckb2Ickb, ckbSoftCapPerDeposit, ickb2Ckb, ickbDelta, ickbDeposit,
+    ickbLogicScript, ickbRequestWithdrawalWith, ickbSifter, ickbSudtFundAdapter, limitOrder
 } from "@ickb/v1-core";
 import { TransactionSkeleton, TransactionSkeletonType } from "@ckb-lumos/helpers";
 import { Cell, Hexadecimal, OutPoint } from "@ckb-lumos/base";
+import memoize from "sonic-memoize";
 
 //ADD some checks for initial bot capital
 
@@ -55,21 +56,32 @@ async function main() {
     let assets = ckbFundAdapter(botAccount.lockScript, feeRate, botAccount.preSigner, capacities);
     assets = ickbSudtFundAdapter(assets, botAccount.lockScript, sudts, tipHeader, receiptGroups);
 
-    console.log("CKB :", assets["CKB"].balance.div(100000000).toString());
-    console.log("ICKB:", assets["ICKB_SUDT"].balance.div(100000000).toString());
+    console.log(
+        "CKB :",
+        assets["CKB"].availableBalance.div(100000000).toString(),
+        "+",
+        assets["CKB"].balance.sub(assets["CKB"].availableBalance).div(100000000).toString()
+    );
 
-    let tx = TransactionSkeleton();
-    let fundedTx = rebalanceAndFund(tx, assets, ickbDepositPool, tipHeader);
+    console.log(
+        "ICKB:",
+        assets["ICKB_SUDT"].availableBalance.div(100000000).toString(),
+        "+",
+        assets["ICKB_SUDT"].balance.sub(assets["ICKB_SUDT"].availableBalance).div(100000000).toString()
+    );
 
-    for (const order of shuffle([...ckb2SudtOrders, ...sudt2ckbOrders])) {
-        tx = limitOrderInfo.fulfill(tx, order, undefined, undefined);
-        //Re-balance holding between CKB and iCKB
-        let newFundedTx = rebalanceAndFund(tx, assets, ickbDepositPool, tipHeader);
-        if (!newFundedTx) {
-            break
+    function calculateGain(tx: TransactionSkeletonType) {
+        if (tx.inputs.size === 0 && tx.outputs.size === 0) {
+            return BI.from(0);
         }
-        fundedTx = newFundedTx;
+
+        const gain = ickb2Ckb(ickbDelta(tx), tipHeader).add(ckbDelta(tx, 0));
+        return rebalanceAndFund(tx, assets, ickbDepositPool, tipHeader) ? gain : negInf;
     }
+
+    let tx = bestPartialFilling(limitOrderInfo, ckb2SudtOrders, sudt2ckbOrders, tipHeader, calculateGain);;
+    //Re-balance holding between CKB and iCKB
+    let fundedTx = rebalanceAndFund(tx, assets, ickbDepositPool, tipHeader);
     if (!fundedTx) {
         return
     }
@@ -82,6 +94,81 @@ async function main() {
 
     const txHash = await sendTransaction(botAccount.signer(fundedTx));
     console.log(txHash);
+}
+
+const negInf = BI.from(0).sub(BI.from(1).shl(64));
+
+function bestPartialFilling(
+    limitOrderInfo: ReturnType<typeof limitOrder>,
+    ckb2SudtOrders: LimitOrder[],
+    sudt2ckbOrders: LimitOrder[],
+    tipHeader: I8Header,
+    calculateGain: (tx: TransactionSkeletonType) => BI
+) {
+    const aPartials = partials(limitOrderInfo, ckb2SudtOrders, ckbSoftCapPerDeposit(tipHeader));
+    const bPartials = partials(limitOrderInfo, sudt2ckbOrders, ICKB_SOFT_CAP_PER_DEPOSIT);
+    const from = memoize(function (aIndex: number, bIndex: number) {
+        let tx = TransactionSkeleton();
+        let gain = negInf;
+        const a = aPartials[aIndex];
+        const b = bPartials[bIndex];
+        if (!a || !b) {
+            return { aIndex, bIndex, tx, gain };
+        }
+
+        tx = addCells(tx, "matched", a.orders.concat(b.orders), a.fulfillments.concat(b.fulfillments));
+        gain = calculateGain(tx);
+        return { aIndex, bIndex, tx, gain };
+    });
+
+    let fresh = from(0, 0);
+    let old: typeof fresh | undefined = undefined;
+    while (old !== fresh) {
+        old = fresh;
+        fresh = [
+            from(fresh.aIndex, fresh.bIndex),
+            from(fresh.aIndex, fresh.bIndex + 1),
+            from(fresh.aIndex + 1, fresh.bIndex),
+            from(fresh.aIndex + 1, fresh.bIndex + 1)
+        ].reduce((a, b) => a.gain.gt(b.gain) ? a : b);
+    }
+
+    // console.log(fresh.aIndex, fresh.bIndex, fresh.gain.div(100000000).toString());
+
+    return fresh.tx;
+}
+
+function partials(
+    limitOrderInfo: ReturnType<typeof limitOrder>,
+    origin: LimitOrder[],
+    allowanceStep: BI,
+) {
+    let orders: readonly I8Cell[] = Object.freeze([]);
+    let completedOrders: readonly I8Cell[] = Object.freeze([]);
+    let fulfillments: readonly I8Cell[] = Object.freeze([]);
+
+    const res = [{ orders, fulfillments }];
+
+    for (const o of origin) {
+        let sudtAllowance = BI.from(0);
+        let ckbAllowance = BI.from(0);
+
+        let fulfillment: I8Cell;
+        let isComplete = false;
+        orders = Object.freeze(orders.concat([o.cell]));
+        while (!isComplete) {
+            ckbAllowance = ckbAllowance.add(allowanceStep);
+            sudtAllowance = sudtAllowance.add(allowanceStep);
+
+            ({ fulfillment, isComplete } = limitOrderInfo.satisfy(o, ckbAllowance, sudtAllowance));
+            fulfillments = Object.freeze(completedOrders.concat([fulfillment]));
+
+            res.push({ orders, fulfillments });
+        }
+        completedOrders = fulfillments;
+    }
+
+    return res;
 }
 
 async function siftCells(
@@ -113,7 +200,7 @@ async function siftCells(
         ickbDepositPool,
         notIckbs
     } = await myIckbSifter(notCapacities, botAccount.expander);
-    const { ckb2SudtOrders, sudt2ckbOrders } = limitOrderInfo.sifter(notIckbs);
+    const { ckb2SudtOrders, sudt2ckbOrders } = limitOrderInfo.sifter(notIckbs, undefined, "asc");
 
     return {
         capacities,
@@ -147,15 +234,37 @@ function rebalanceAndFund(
         }
     }
 
-    //Ideally keep a SUDT balance between one and three deposits, with two deposits being the perfect spot
-    const ickbBalance = a["ICKB_SUDT"].balance;
-    if (ickbBalance.lt(ICKB_SOFT_CAP_PER_DEPOSIT)) {
-        //One deposit for each transaction
-        tx = ickbDeposit(tx, 1, tipHeader);
-    } else if (ickbBalance.gt(ICKB_SOFT_CAP_PER_DEPOSIT.mul(3))) {
-        const ickbExcess = ickbBalance.sub(ICKB_SOFT_CAP_PER_DEPOSIT.mul(2));
-        tx = ickbRequestWithdrawalWith(tx, ickbDepositPool, tipHeader, ickbExcess);
+    // For simplicity a transaction containing Nervos DAO script is currently limited to 64 output cells
+    // so that processing is simplified, this limitation may be relaxed later on in a future Nervos DAO script update.
+    //58 = 64 - 6, 6 are the estimated change cells added later
+    const daoLimit = 58 - tx.outputs.size;
+
+    //Keep most balance in SUDT
+    //Ideally keep a CKB balance between one and three deposits, with two deposits being the perfect spot
+    const ckbBalance = a["CKB"].balance;
+    const softCapPerDeposit = ckbSoftCapPerDeposit(tipHeader);
+    if (daoLimit <= 0) {
+        //Do nothing...
+    } else if (ckbBalance.lt(softCapPerDeposit.mul(2))) {
+        const maxWithdrawAmount = ckb2Ickb(softCapPerDeposit.mul(2).sub(ckbBalance), tipHeader);
+        tx = ickbRequestWithdrawalWith(tx, ickbDepositPool, tipHeader, maxWithdrawAmount, daoLimit);
+    } else if (ckbBalance.gt(softCapPerDeposit.mul(3))) {
+        const deposits = ckbBalance.div(softCapPerDeposit).sub(2).toNumber();
+        tx = ickbDeposit(tx, deposits < daoLimit ? deposits : daoLimit, tipHeader);
     }
+
+    // //Keep most balance in CKB
+    // //Ideally keep a SUDT balance between one and three deposits, with two deposits being the perfect spot
+    // const ickbBalance = a["ICKB_SUDT"].balance;
+    // if (daoLimit <= 0) {
+    //     //Do nothing...
+    // } else if (ickbBalance.lt(ICKB_SOFT_CAP_PER_DEPOSIT)) {
+    //     //One deposit for each transaction
+    //     tx = ickbDeposit(tx, 1, tipHeader);
+    // } else if (ickbBalance.gt(ICKB_SOFT_CAP_PER_DEPOSIT.mul(3))) {
+    //     const ickbExcess = ickbBalance.sub(ICKB_SOFT_CAP_PER_DEPOSIT.mul(2));
+    //     tx = ickbRequestWithdrawalWith(tx, ickbDepositPool, tipHeader, ickbExcess, daoLimit);
+    // }
 
     if (tx.outputs.size === 0) {
         return undefined;
@@ -164,7 +273,7 @@ function rebalanceAndFund(
     try {
         return fund(tx, assets, true);
     } catch (e: any) {
-        if (e && e.message === errorNotEnoughFunds) {
+        if (e && (e.message === errorNotEnoughFunds || e.message === errorTooManyOutputs)) {
             return undefined;
         }
         throw e;
@@ -188,28 +297,41 @@ const headerPlaceholder = I8Header.from({
 });
 let _blockNum2Header = new Map<string, I8Header>();
 async function myIckbSifter(inputs: readonly Cell[], accountLockExpander: (c: Cell) => I8Script | undefined) {
-    while (true) {//Dangerous/////////////////////////////////////////////////////////////////////////////////
+    function attemptIckbSifting() {
+        let allHeadersFound = true;
         const queries: { blockNum: Hexadecimal, context: OutPoint }[] = [];
-        let missingHeaders = false;
         function getHeader(blockNumber: string, context: Cell): I8Header {
             queries.push({ blockNum: blockNumber, context: context.outPoint! });
             let h = _blockNum2Header.get(blockNumber);
             if (!h) {
                 h = headerPlaceholder;
-                missingHeaders = true;
+                allHeadersFound = false;
             }
             return h;
         }
-
-        const result = ickbSifter(inputs, accountLockExpander, getHeader);
-        if (!missingHeaders) {
-            return result;
+        const ickbSifterResult = ickbSifter(inputs, accountLockExpander, getHeader);
+        return {
+            ickbSifterResult,
+            allHeadersFound,
+            queries
         }
-
-        //Discard result, just fetch wanted headers
-        const headers = await getHeaderByNumber(queries, Array.from(_blockNum2Header.values()));
-        _blockNum2Header = new Map(headers.map(h => [h.number, h]));
     }
+
+    let r = attemptIckbSifting();
+    if (r.allHeadersFound) {
+        return r.ickbSifterResult;
+    }
+
+    //Fetch wanted headers from L1
+    const headers = await getHeaderByNumber(r.queries, Array.from(_blockNum2Header.values()));
+    _blockNum2Header = new Map(headers.map(h => [h.number, h]));
+
+    r = attemptIckbSifting();
+    if (r.allHeadersFound) {
+        return r.ickbSifterResult;
+    }
+
+    throw Error("Unable to get some headers");
 }
 
 const clientType2IsLightClient: { [id: string]: boolean } = {
