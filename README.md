@@ -1,8 +1,6 @@
 # iCKB v1 bot
 
-## Setup
-
-### Run the limit order fulfillment bot
+## Run the limit order fulfillment bot on testnet
 
 1. Download this repo in a folder of your choice:  
 
@@ -22,15 +20,19 @@ cd v1-bot
 npm i
 ```
 
-4. Start matching user limit orders:
+4. Define a `env/testnet/.env` file, for example:
+
+```
+CHAIN=testnet
+BOT_PRIVATE_KEY=0x-YOUR-SECP256K1-BLAKE160-PRIVATE-KEY
+FUNDING_PRIVATE_KEY=0x-YOUR-FUNDING-SECP256K1-BLAKE160-PRIVATE-KEY
+```
+
+5. Start matching user limit orders:
 
 ```bash
 npm run start --chain=testnet
 ```
-
-## Complete Devnet Setup
-
-Please refer to the [Complete Setup section in iCKB core](https://github.com/ickb/v1-core/#complete-setup).
 
 ## Licensing
 
