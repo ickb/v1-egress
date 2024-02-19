@@ -1,9 +1,8 @@
-import config from "./config.json";
 import { Config } from "@ckb-lumos/config-manager";
 import { BI, parseUnit } from "@ckb-lumos/bi";
 import {
     Assets, I8Cell, I8Header, I8Script, addCells, capacitySifter, ckbDelta, ckbFundAdapter, errorNotEnoughFunds,
-    errorTooManyOutputs, fund, genesisDevnetKey, getCells, getFeeRate, getHeaderByNumber, getTipHeader,
+    errorTooManyOutputs, fund, getCells, getChainInfo, getFeeRate, getHeaderByNumber, getTipHeader,
     initializeChainAdapter, isChain, isDaoDeposit, isDaoWithdrawalRequest, secp256k1Blake160, sendTransaction
 } from "@ickb/lumos-utils";
 import {
@@ -14,26 +13,21 @@ import { TransactionSkeleton, TransactionSkeletonType } from "@ckb-lumos/helpers
 import { Cell, Hexadecimal, OutPoint } from "@ckb-lumos/base";
 import memoize from "sonic-memoize";
 
-//ADD some checks for initial bot capital
-
 async function main() {
-    const args = process.argv.slice(2);
-    const [chain, rpcUrl, clientType] = args;
-
-    if (args.length < 1 || args.length > 3
-        || !isChain(chain)
-        || !(clientType in clientType2IsLightClient)) {
-        throw Error("Invalid command line arguments " + args.join(" "));
+    const { CHAIN, RPC_URL, CLIENT_TYPE, BOT_PRIVATE_KEY, FUNDING_PRIVATE_KEY } = process.env;
+    if (!isChain(CHAIN)) {
+        throw Error("Invalid env CHAIN: " + CHAIN);
     }
-
-    await initializeChainAdapter(chain, config as Config, rpcUrl, clientType2IsLightClient[clientType]);
-
-    if (chain === "mainnet") {
+    if (CHAIN === "mainnet") {
         throw Error("Not yet ready for mainnet...")
     }
+    if (!BOT_PRIVATE_KEY) {
+        throw Error("Empty env BOT_PRIVATE_KEY")
+    }
+    const config: Config = await import(`../env/${CHAIN}/config.json`);
+    await initializeChainAdapter(CHAIN, config, RPC_URL, CLIENT_TYPE === "light" ? true : undefined);
 
-    const testingBotKey = "0xd4a18c9653909588b71551a641a6fed44f2893c9a81f8b46998582a6c98fc5a0";
-    let botAccount = secp256k1Blake160(testingBotKey);
+    const botAccount = secp256k1Blake160(BOT_PRIVATE_KEY);
     const limitOrderInfo = limitOrder();
 
     const {
@@ -42,10 +36,14 @@ async function main() {
         ckb2SudtOrders, sudt2ckbOrders
     } = await siftCells(botAccount, limitOrderInfo);
 
+    //ADD some checks for initial bot capital
     if (capacities.length === 0 && sudts.length === 0) {
+        if (!FUNDING_PRIVATE_KEY) {
+            throw Error("Empty env FUNDING_PRIVATE_KEY")
+        }
         console.log("Funding bot");
-        const genesisAccount = secp256k1Blake160(genesisDevnetKey);
-        const txHash = await genesisAccount.transfer(botAccount.lockScript, parseUnit("1000000", "ckb"));
+        const fundingAccount = secp256k1Blake160(FUNDING_PRIVATE_KEY);
+        const txHash = await fundingAccount.transfer(botAccount.lockScript, parseUnit("1000000", "ckb"));
         console.log(txHash);
         return;
     }
@@ -234,6 +232,10 @@ function rebalanceAndFund(
         }
     }
 
+    const { chain } = getChainInfo();
+    const minLock = chain === "devnet" ? undefined : { length: 16, index: 1, number: 0 };// 1/8 epoch (~ 15 minutes)
+    const maxLock = chain === "devnet" ? undefined : { length: 4, index: 1, number: 0 };// 1/4 epoch (~ 1 hour)
+
     // For simplicity a transaction containing Nervos DAO script is currently limited to 64 output cells
     // so that processing is simplified, this limitation may be relaxed later on in a future Nervos DAO script update.
     //58 = 64 - 6, 6 are the estimated change cells added later
@@ -247,7 +249,7 @@ function rebalanceAndFund(
         //Do nothing...
     } else if (ckbBalance.lt(softCapPerDeposit.mul(2))) {
         const maxWithdrawAmount = ckb2Ickb(softCapPerDeposit.mul(2).sub(ckbBalance), tipHeader);
-        tx = ickbRequestWithdrawalWith(tx, ickbDepositPool, tipHeader, maxWithdrawAmount, daoLimit);
+        tx = ickbRequestWithdrawalWith(tx, ickbDepositPool, tipHeader, maxWithdrawAmount, daoLimit, minLock, maxLock);
     } else if (ckbBalance.gt(softCapPerDeposit.mul(3))) {
         const deposits = ckbBalance.div(softCapPerDeposit).sub(2).toNumber();
         tx = ickbDeposit(tx, deposits < daoLimit ? deposits : daoLimit, tipHeader);
@@ -263,7 +265,7 @@ function rebalanceAndFund(
     //     tx = ickbDeposit(tx, 1, tipHeader);
     // } else if (ickbBalance.gt(ICKB_SOFT_CAP_PER_DEPOSIT.mul(3))) {
     //     const ickbExcess = ickbBalance.sub(ICKB_SOFT_CAP_PER_DEPOSIT.mul(2));
-    //     tx = ickbRequestWithdrawalWith(tx, ickbDepositPool, tipHeader, ickbExcess, daoLimit);
+    //     tx = ickbRequestWithdrawalWith(tx, ickbDepositPool, tipHeader, ickbExcess, minLock, maxLock);
     // }
 
     if (tx.outputs.size === 0) {
@@ -333,11 +335,5 @@ async function myIckbSifter(inputs: readonly Cell[], accountLockExpander: (c: Ce
 
     throw Error("Unable to get some headers");
 }
-
-const clientType2IsLightClient: { [id: string]: boolean } = {
-    "light": true,
-    "full": false,
-    undefined: false
-};
 
 main();

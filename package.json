@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "description": "",
   "scripts": {
-    "matchOrder": "ts-node src/index.ts"
+    "start": "watch -n 60 node -r ts-node/register --env-file=env/${npm_config_chain}/.env src/index.ts",
+    "once": "node -r ts-node/register --env-file=env/${npm_config_chain}/.env src/index.ts"
   },
   "keywords": [],
   "author": "",
