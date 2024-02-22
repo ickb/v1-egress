@@ -25,7 +25,12 @@ npm i
 ```
 CHAIN=testnet
 BOT_PRIVATE_KEY=0x-YOUR-SECP256K1-BLAKE160-PRIVATE-KEY
-FUNDING_PRIVATE_KEY=0x-YOUR-FUNDING-SECP256K1-BLAKE160-PRIVATE-KEY
+```
+
+Optionally the property `RPC_URL` can also be specified:
+
+```
+RPC_URL=http://127.0.0.1:8114/
 ```
 
 5. Start matching user limit orders:

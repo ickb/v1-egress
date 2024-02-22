@@ -1,5 +1,5 @@
 import { Config } from "@ckb-lumos/config-manager";
-import { BI, parseUnit } from "@ckb-lumos/bi";
+import { BI } from "@ckb-lumos/bi";
 import {
     Assets, I8Cell, I8Header, I8Script, addCells, capacitySifter, ckbDelta, ckbFundAdapter, errorNotEnoughFunds,
     errorTooManyOutputs, fund, getCells, getChainInfo, getFeeRate, getHeaderByNumber, getTipHeader,
@@ -14,7 +14,7 @@ import { Cell, Hexadecimal, OutPoint } from "@ckb-lumos/base";
 import memoize from "sonic-memoize";
 
 async function main() {
-    const { CHAIN, RPC_URL, CLIENT_TYPE, BOT_PRIVATE_KEY, FUNDING_PRIVATE_KEY } = process.env;
+    const { CHAIN, RPC_URL, CLIENT_TYPE, BOT_PRIVATE_KEY } = process.env;
     if (!isChain(CHAIN)) {
         throw Error("Invalid env CHAIN: " + CHAIN);
     }
@@ -36,17 +36,7 @@ async function main() {
         ckb2SudtOrders, sudt2ckbOrders
     } = await siftCells(botAccount, limitOrderInfo);
 
-    //ADD some checks for initial bot capital
-    if (capacities.length === 0 && sudts.length === 0) {
-        if (!FUNDING_PRIVATE_KEY) {
-            throw Error("Empty env FUNDING_PRIVATE_KEY")
-        }
-        console.log("Funding bot");
-        const fundingAccount = secp256k1Blake160(FUNDING_PRIVATE_KEY);
-        const txHash = await fundingAccount.transfer(botAccount.lockScript, parseUnit("1000000", "ckb"));
-        console.log(txHash);
-        return;
-    }
+    //ADD some checks for initial bot capital////////////////////////////////////////////////////////
 
     const tipHeader = await getTipHeader();
     const feeRate = await getFeeRate();
