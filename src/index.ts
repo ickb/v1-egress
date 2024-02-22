@@ -36,8 +36,6 @@ async function main() {
         ckb2SudtOrders, sudt2ckbOrders
     } = await siftCells(botAccount, limitOrderInfo);
 
-    //ADD some checks for initial bot capital////////////////////////////////////////////////////////
-
     const tipHeader = await getTipHeader();
     const feeRate = await getFeeRate();
 
@@ -57,6 +55,16 @@ async function main() {
         "+",
         assets["ICKB_SUDT"].balance.sub(assets["ICKB_SUDT"].availableBalance).div(100000000).toString()
     );
+
+    const totalBalance = ickb2Ckb(assets["ICKB_SUDT"].balance, tipHeader).add(assets["CKB"].balance);
+    const fiveDeposits = ckbSoftCapPerDeposit(tipHeader).mul(5)
+    if (totalBalance.lt(fiveDeposits)) {
+        console.log();
+        console.log(`${totalBalance.div(100000000).toString()} CKB < ${fiveDeposits.div(100000000).toString()} CKB`);
+        console.log("Warning: the total bot balance is lower than five standard deposits!!");
+        console.log("The bot may not be able to properly match orders.");
+        console.log();
+    }
 
     function calculateGain(tx: TransactionSkeletonType) {
         if (tx.inputs.size === 0 && tx.outputs.size === 0) {
