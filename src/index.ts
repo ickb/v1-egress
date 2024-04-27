@@ -1,5 +1,5 @@
 import { Config } from "@ckb-lumos/config-manager";
-import { BI } from "@ckb-lumos/bi";
+import { BI, parseUnit } from "@ckb-lumos/bi";
 import {
     Assets, I8Cell, I8Header, I8Script, addCells, capacitySifter, ckbDelta, ckbFundAdapter, errorNotEnoughFunds,
     errorTooManyOutputs, fund, getCells, getChainInfo, getFeeRate, getHeaderByNumber, getTipHeader,
@@ -72,12 +72,12 @@ async function main() {
         }
 
         const gain = ickb2Ckb(ickbDelta(tx), tipHeader).add(ckbDelta(tx, 0));
-        return rebalanceAndFund(tx, assets, ickbDepositPool, tipHeader) ? gain : negInf;
+        return rebalanceAndFund(tx, assets, ickbDepositPool, tipHeader, botAccount.lockScript) ? gain : negInf;
     }
 
     let tx = bestPartialFilling(limitOrderInfo, ckb2SudtOrders, sudt2ckbOrders, tipHeader, calculateGain);;
     //Re-balance holding between CKB and iCKB
-    let fundedTx = rebalanceAndFund(tx, assets, ickbDepositPool, tipHeader);
+    let fundedTx = rebalanceAndFund(tx, assets, ickbDepositPool, tipHeader, botAccount.lockScript);
     if (!fundedTx) {
         return
     }
@@ -209,7 +209,8 @@ function rebalanceAndFund(
     tx: TransactionSkeletonType,
     assets: Assets,
     ickbDepositPool: readonly I8Cell[],
-    tipHeader: I8Header
+    tipHeader: I8Header,
+    accountLock: I8Script
 ) {
     //Balance should be after the current transaction, so it should account for transaction cells
     const a = Object.freeze(//after Tx Balances
@@ -243,15 +244,21 @@ function rebalanceAndFund(
     //Ideally keep a CKB balance between one and three deposits, with two deposits being the perfect spot
     const ckbBalance = a["CKB"].balance;
     const softCapPerDeposit = ckbSoftCapPerDeposit(tipHeader);
+    let shouldSetApartEmergencyCKB = true;
     if (daoLimit <= 0) {
         //Do nothing...
     } else if (ckbBalance.lt(softCapPerDeposit.mul(2))) {
         const maxWithdrawAmount = ckb2Ickb(softCapPerDeposit.mul(2).sub(ckbBalance), tipHeader);
-        tx = ickbRequestWithdrawalWith(tx, ickbDepositPool, tipHeader, maxWithdrawAmount, daoLimit, minLock, maxLock);
+        const new_tx = ickbRequestWithdrawalWith(tx, ickbDepositPool, tipHeader, maxWithdrawAmount, daoLimit, minLock, maxLock);
+        if (new_tx.inputs.size != tx.inputs.size) {
+            shouldSetApartEmergencyCKB = false;
+        }
+        tx = new_tx;
     } else if (ckbBalance.gt(softCapPerDeposit.mul(3))) {
         const deposits = ckbBalance.div(softCapPerDeposit).sub(2).toNumber();
         tx = ickbDeposit(tx, deposits < daoLimit ? deposits : daoLimit, tipHeader);
     }
+
 
     // //Keep most balance in CKB
     // //Ideally keep a SUDT balance between one and three deposits, with two deposits being the perfect spot
@@ -270,6 +277,10 @@ function rebalanceAndFund(
         return undefined;
     }
 
+    if (shouldSetApartEmergencyCKB) {
+        tx = setApartEmergencyCKB(tx, accountLock);
+    }
+
     try {
         return fund(tx, assets, true);
     } catch (e: any) {
@@ -279,6 +290,11 @@ function rebalanceAndFund(
         throw e;
     }
 
+}
+
+function setApartEmergencyCKB(tx: TransactionSkeletonType, accountLock: I8Script) {
+    let c = I8Cell.from({ lock: accountLock, capacity: parseUnit("1000", "ckb").toHexString() });
+    return addCells(tx, "append", [], [c]);
 }
 
 const headerPlaceholder = I8Header.from({
