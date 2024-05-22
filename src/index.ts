@@ -1,20 +1,23 @@
-import { Config } from "@ckb-lumos/config-manager";
-import { BI, parseUnit } from "@ckb-lumos/bi";
+import type { Cell, Hexadecimal, OutPoint } from "@ckb-lumos/base";
+import { TransactionSkeleton, } from "@ckb-lumos/helpers";
+import type { TransactionSkeletonType } from "@ckb-lumos/helpers";
 import {
-    Assets, I8Cell, I8Header, I8Script, addCells, capacitySifter, ckbDelta, ckbFundAdapter, errorNotEnoughFunds,
+    addCells, addCkbAsset, addSimpleCells, capacitySifter, CKB, ckbDelta, ckbMark, errorNotEnoughFunds,
     errorTooManyOutputs, fund, getCells, getChainInfo, getFeeRate, getHeaderByNumber, getTipHeader,
-    initializeChainAdapter, isChain, isDaoDeposit, isDaoWithdrawalRequest, secp256k1Blake160, sendTransaction
+    hex, I8Cell, I8Header, initializeChainAdapter, isChain, isDaoDeposit, isDaoWithdrawalRequest,
+    scriptEq, secp256k1Blake160, sendTransaction
 } from "@ickb/lumos-utils";
+import type { Assets, I8Script } from "@ickb/lumos-utils";
 import {
-    ICKB_SOFT_CAP_PER_DEPOSIT, LimitOrder, ckb2Ickb, ckbSoftCapPerDeposit, ickb2Ckb, ickbDelta, ickbDeposit,
-    ickbLogicScript, ickbRequestWithdrawalWith, ickbSifter, ickbSudtFundAdapter, limitOrder
+    ICKB_SOFT_CAP_PER_DEPOSIT, addIckbAsset, addOrders, addWithdrawalRequestGroups, ckb2Ickb, ckb2UdtRatioCompare,
+    ckbSoftCapPerDeposit, errorAllowanceTooLow, getIckbScriptConfigs, ickb2Ckb, ickbDelta, ickbDeposit,
+    ickbExchangeRatio, ickbLogicScript, ickbMark, ickbRequestWithdrawalWith, ickbSifter, limitOrderScript,
+    orderSatisfy, orderSifter, ownedOwnerScript, udt2CkbRatioCompare
 } from "@ickb/v1-core";
-import { TransactionSkeleton, TransactionSkeletonType } from "@ckb-lumos/helpers";
-import { Cell, Hexadecimal, OutPoint } from "@ckb-lumos/base";
-import memoize from "sonic-memoize";
+import type { Order } from "@ickb/v1-core";
 
 async function main() {
-    const { CHAIN, RPC_URL, CLIENT_TYPE, BOT_PRIVATE_KEY } = process.env;
+    const { CHAIN, RPC_URL, CLIENT_TYPE, BOT_PRIVATE_KEY, BOT_SLEEP_INTERVAL } = process.env;
     if (!isChain(CHAIN)) {
         throw Error("Invalid env CHAIN: " + CHAIN);
     }
@@ -24,156 +27,218 @@ async function main() {
     if (!BOT_PRIVATE_KEY) {
         throw Error("Empty env BOT_PRIVATE_KEY")
     }
-    const config: Config = await import(`../env/${CHAIN}/config.json`);
-    await initializeChainAdapter(CHAIN, config, RPC_URL, CLIENT_TYPE === "light" ? true : undefined);
-
-    const botAccount = secp256k1Blake160(BOT_PRIVATE_KEY);
-    const limitOrderInfo = limitOrder();
-
-    const {
-        capacities,
-        sudts, receiptGroups, ickbDepositPool,
-        ckb2SudtOrders, sudt2ckbOrders
-    } = await siftCells(botAccount, limitOrderInfo);
-
-    const tipHeader = await getTipHeader();
-    const feeRate = await getFeeRate();
-
-    let assets = ckbFundAdapter(botAccount.lockScript, feeRate, botAccount.preSigner, capacities);
-    assets = ickbSudtFundAdapter(assets, botAccount.lockScript, sudts, tipHeader, receiptGroups);
-
-    console.log(
-        "CKB :",
-        assets["CKB"].availableBalance.div(100000000).toString(),
-        "+",
-        assets["CKB"].balance.sub(assets["CKB"].availableBalance).div(100000000).toString()
-    );
-
-    console.log(
-        "ICKB:",
-        assets["ICKB_SUDT"].availableBalance.div(100000000).toString(),
-        "+",
-        assets["ICKB_SUDT"].balance.sub(assets["ICKB_SUDT"].availableBalance).div(100000000).toString()
-    );
-
-    const totalBalance = ickb2Ckb(assets["ICKB_SUDT"].balance, tipHeader).add(assets["CKB"].balance);
-    const fiveDeposits = ckbSoftCapPerDeposit(tipHeader).mul(5)
-    if (totalBalance.lt(fiveDeposits)) {
-        console.log();
-        console.log(`${totalBalance.div(100000000).toString()} CKB < ${fiveDeposits.div(100000000).toString()} CKB`);
-        console.log("Warning: the total bot balance is lower than five standard deposits!!");
-        console.log("The bot may not be able to properly match orders.");
-        console.log();
+    if (!BOT_SLEEP_INTERVAL || Number(BOT_SLEEP_INTERVAL) < 1) {
+        throw Error("Invalid env BOT_SLEEP_INTERVAL")
     }
 
-    function calculateGain(tx: TransactionSkeletonType) {
-        if (tx.inputs.size === 0 && tx.outputs.size === 0) {
-            return BI.from(0);
+    await initializeChainAdapter(CHAIN, RPC_URL, CLIENT_TYPE === "light" ? true : undefined, getIckbScriptConfigs);
+    const account = secp256k1Blake160(BOT_PRIVATE_KEY);
+    const sleepInterval = Number(BOT_SLEEP_INTERVAL) * 1000;
+
+    const orderScript = limitOrderScript();
+
+    while (true) {
+        let executionLog: any = {};
+        let startTime = new Date();
+        executionLog.startTime = startTime.toLocaleString();
+        try {
+            const {
+                capacities, udts, receipts, withdrawalRequestGroups, ickbDepositPool, orders, myOrders
+            } = await siftCells(account);
+
+            const tipHeader = await getTipHeader();
+            const feeRate = await getFeeRate();
+            const minChange = 0n;//Use minChange as relevant instead of setApartEmergencyCKB ////////////////////////
+
+            let assets = addCkbAsset({}, account.lockScript, feeRate, account.preSigner, minChange);
+            assets = addIckbAsset(assets, account.lockScript);
+            assets = addSimpleCells(assets, capacities, udts, receipts);
+            assets = addWithdrawalRequestGroups(assets, withdrawalRequestGroups, tipHeader);
+            assets = addOrders(assets, myOrders);
+
+            executionLog.balance = {
+                "CKB": {
+                    total: fmtCkb(assets[ckbMark].estimated),
+                    available: fmtCkb(assets[ckbMark].estimatedAvailable),
+                    unavailable: fmtCkb(assets[ckbMark].estimated - assets[ckbMark].estimatedAvailable),
+                }, "ICKB": {
+                    total: fmtCkb(assets[ickbMark].estimated),
+                    available: fmtCkb(assets[ickbMark].estimatedAvailable),
+                    unavailable: fmtCkb(assets[ickbMark].estimated - assets[ickbMark].estimatedAvailable),
+                }, "totalEquivalent": {
+                    "CKB": fmtCkb(assets[ckbMark].estimated + ickb2Ckb(assets[ickbMark].estimated, tipHeader)),
+                    "ICKB": fmtCkb(ckb2Ickb(assets[ckbMark].estimated, tipHeader) + assets[ickbMark].estimated),
+                }
+            };
+            executionLog.ratio = ickbExchangeRatio(tipHeader);
+
+            function evaluate(combination: Combination): Combination {
+                let { i, j, tx } = combination;
+                let fundedTx = rebalanceAndFund(tx, assets, ickbDepositPool, tipHeader, account.lockScript);
+                let gain = ickb2Ckb(ickbDelta(tx), tipHeader) + ckbDelta(tx, 0n);
+                gain = i == 0 && j == 0 ? 0n : !fundedTx ? negInf : gain - 3n * ckbDelta(fundedTx, 0n);
+                return { ...combination, fundedTx, gain }
+            }
+
+            let { fundedTx: tx } = bestPartialFilling(
+                orders,
+                evaluate,
+                ckbSoftCapPerDeposit(tipHeader) / 10n,
+                ICKB_SOFT_CAP_PER_DEPOSIT / 10n
+            );
+            if (tx) {
+                // console.log(JSON.stringify(tx, undefined, 2));
+                executionLog.actions = {
+                    matchedOrders: tx.inputs.filter(c => scriptEq(c.cellOutput.lock, orderScript)).size,
+                    deposits: tx.outputs.filter(isDaoDeposit).size,
+                    withdrawalRequests: tx.outputs.filter(isDaoWithdrawalRequest).size,
+                    withdrawals: tx.inputs.filter(isDaoWithdrawalRequest).size,
+                };
+                executionLog.txFee = {
+                    fee: fmtCkb(ckbDelta(tx, 0n)),
+                    feeRate,
+                };
+
+                executionLog.txHash = await sendTransaction(account.signer(tx));
+            }
+        } catch (e: any) {
+            if (e) {
+                executionLog.error = { ...e, stack: e.stack ?? "" };
+            } else {
+                executionLog.message = "Empty";
+            }
         }
+        executionLog.ElapsedSeconds = Math.round((new Date().getTime() - startTime.getTime()) / 1000);
+        console.log(JSON.stringify(executionLog, replacer, " ") + ",");
 
-        const gain = ickb2Ckb(ickbDelta(tx), tipHeader).add(ckbDelta(tx, 0));
-        return rebalanceAndFund(tx, assets, ickbDepositPool, tipHeader, botAccount.lockScript) ? gain : negInf;
+        await new Promise(r => setTimeout(r, sleepInterval));
     }
-
-    let tx = bestPartialFilling(limitOrderInfo, ckb2SudtOrders, sudt2ckbOrders, tipHeader, calculateGain);;
-    //Re-balance holding between CKB and iCKB
-    let fundedTx = rebalanceAndFund(tx, assets, ickbDepositPool, tipHeader, botAccount.lockScript);
-    if (!fundedTx) {
-        return
-    }
-
-    // console.log(JSON.stringify(fundedTx, undefined, 2));
-    fundedTx.inputs.filter(limitOrderInfo.isValid).forEach(() => console.log("Limit Order Matched"));
-    fundedTx.outputs.filter(isDaoDeposit).forEach(() => console.log("Deposit"));
-    fundedTx.outputs.filter(isDaoWithdrawalRequest).forEach(() => console.log("Withdrawal Request"));
-    fundedTx.inputs.filter(isDaoWithdrawalRequest).forEach(() => console.log("Withdrawal"));
-
-    const txHash = await sendTransaction(botAccount.signer(fundedTx));
-    console.log(txHash);
 }
 
-const negInf = BI.from(0).sub(BI.from(1).shl(64));
+function fmtCkb(b: bigint) {
+    return Number(b) / Number(CKB);
+}
+
+function replacer(_: unknown, value: unknown) {
+    return typeof value === "bigint" ? Number(value) : value
+};
+
+const negInf = -1n * (1n << 64n);
+
+type Combination = {
+    i: number,
+    j: number,
+    tx: TransactionSkeletonType,
+    fundedTx: TransactionSkeletonType | undefined,
+    gain: bigint
+};
 
 function bestPartialFilling(
-    limitOrderInfo: ReturnType<typeof limitOrder>,
-    ckb2SudtOrders: LimitOrder[],
-    sudt2ckbOrders: LimitOrder[],
-    tipHeader: I8Header,
-    calculateGain: (tx: TransactionSkeletonType) => BI
+    orders: Order[],
+    evaluate: (tx: Combination) => Combination,
+    ckbAllowanceStep: bigint,
+    udtAllowanceStep: bigint,
 ) {
-    const aPartials = partials(limitOrderInfo, ckb2SudtOrders, ckbSoftCapPerDeposit(tipHeader));
-    const bPartials = partials(limitOrderInfo, sudt2ckbOrders, ICKB_SOFT_CAP_PER_DEPOSIT);
-    const from = memoize(function (aIndex: number, bIndex: number) {
-        let tx = TransactionSkeleton();
-        let gain = negInf;
-        const a = aPartials[aIndex];
-        const b = bPartials[bIndex];
-        if (!a || !b) {
-            return { aIndex, bIndex, tx, gain };
-        }
+    const ckb2UdtPartials = partialsFrom(orders, true, udtAllowanceStep);
+    const udt2CkbPartials = partialsFrom(orders, false, ckbAllowanceStep);
 
-        tx = addCells(tx, "matched", a.orders.concat(b.orders), a.fulfillments.concat(b.fulfillments));
-        gain = calculateGain(tx);
-        return { aIndex, bIndex, tx, gain };
-    });
+    const alreadyVisited = new Map<string, Combination>();
+    const from = (i: number, j: number): Combination => {
+        let key = `${i}-${j}`;
+        let cached = alreadyVisited.get(key);
+        if (cached) {
+            return cached;
+        }
+        let result: Combination = { i, j, tx: TransactionSkeleton(), fundedTx: undefined, gain: negInf };
+        const iom = ckb2UdtPartials[i];
+        const jom = udt2CkbPartials[j];
+        if (iom && jom) {
+            const origins = iom.origins.concat(jom.origins);
+            const matches = iom.matches.concat(jom.matches)
+            result.tx = addCells(result.tx, "append", origins, matches);
+            result = evaluate(result);
+        }
+        alreadyVisited.set(key, Object.freeze(result));
+        return result;
+    };
 
     let fresh = from(0, 0);
     let old: typeof fresh | undefined = undefined;
     while (old !== fresh) {
         old = fresh;
         fresh = [
-            from(fresh.aIndex, fresh.bIndex),
-            from(fresh.aIndex, fresh.bIndex + 1),
-            from(fresh.aIndex + 1, fresh.bIndex),
-            from(fresh.aIndex + 1, fresh.bIndex + 1)
-        ].reduce((a, b) => a.gain.gt(b.gain) ? a : b);
+            from(fresh.i, fresh.j),
+            from(fresh.i, fresh.j + 1),
+            from(fresh.i + 1, fresh.j),
+            from(fresh.i + 1, fresh.j + 1)
+        ].reduce((a, b) => a.gain > b.gain ? a : b);
     }
 
-    // console.log(fresh.aIndex, fresh.bIndex, fresh.gain.div(100000000).toString());
+    // console.log(fresh.i, fresh.j, String(fresh.gain / CKB));
 
-    return fresh.tx;
+    return fresh;
 }
 
-function partials(
-    limitOrderInfo: ReturnType<typeof limitOrder>,
-    origin: LimitOrder[],
-    allowanceStep: BI,
+function partialsFrom(
+    orders: Order[],
+    isCkb2Udt: boolean,
+    allowanceStep: bigint,
 ) {
-    let orders: readonly I8Cell[] = Object.freeze([]);
-    let completedOrders: readonly I8Cell[] = Object.freeze([]);
-    let fulfillments: readonly I8Cell[] = Object.freeze([]);
+    let ckbAllowanceStep, udtAllowanceStep;
+    if (isCkb2Udt) {
+        ckbAllowanceStep = 0n;
+        udtAllowanceStep = allowanceStep;
+        orders = orders.filter(o => o.info.isCkb2UdtMatchable);
+        orders.sort((o0, o1) => ckb2UdtRatioCompare(o0.info.ckbToUdt, o1.info.ckbToUdt));
+    } else {
+        ckbAllowanceStep = allowanceStep;
+        udtAllowanceStep = 0n;
+        orders = orders.filter(o => o.info.isUdt2CkbMatchable);
+        orders.sort((o0, o1) => udt2CkbRatioCompare(o0.info.udtToCkb, o1.info.udtToCkb));
+    }
 
-    const res = [{ orders, fulfillments }];
+    let origins: readonly I8Cell[] = Object.freeze([]);
+    let fulfilled: readonly I8Cell[] = Object.freeze([]);
+    let matches: readonly I8Cell[] = Object.freeze([]);
 
-    for (const o of origin) {
-        let sudtAllowance = BI.from(0);
-        let ckbAllowance = BI.from(0);
+    const res = [{ origins, matches }];
 
-        let fulfillment: I8Cell;
-        let isComplete = false;
-        orders = Object.freeze(orders.concat([o.cell]));
-        while (!isComplete) {
-            ckbAllowance = ckbAllowance.add(allowanceStep);
-            sudtAllowance = sudtAllowance.add(allowanceStep);
+    for (const o of orders) {
+        try {
+            let ckbAllowance = 0n;
+            let udtAllowance = 0n;
 
-            ({ fulfillment, isComplete } = limitOrderInfo.satisfy(o, ckbAllowance, sudtAllowance));
-            fulfillments = Object.freeze(completedOrders.concat([fulfillment]));
+            let match: I8Cell;
+            let isFulfilled = false;
 
-            res.push({ orders, fulfillments });
+            let new_origins = Object.freeze(origins.concat([o.cell]));
+            while (!isFulfilled) {
+                ckbAllowance += ckbAllowanceStep;
+                udtAllowance += udtAllowanceStep;
+
+                ({ match, isFulfilled } = orderSatisfy(o, isCkb2Udt, ckbAllowance, udtAllowance));
+                matches = Object.freeze(fulfilled.concat([match]));
+
+                res.push({ origins: new_origins, matches });
+            }
+
+            origins = new_origins;
+            fulfilled = matches;
+        } catch (e: any) {
+            // Skip orders whose ckbMinMatch is too high to be matched by base allowance Step
+            if (!e || e.message !== errorAllowanceTooLow) {
+                throw e;
+            }
         }
-        completedOrders = fulfillments;
     }
 
     return res;
 }
 
-async function siftCells(
-    botAccount: ReturnType<typeof secp256k1Blake160>,
-    limitOrderInfo: ReturnType<typeof limitOrder>
-) {
+async function siftCells(account: ReturnType<typeof secp256k1Blake160>) {
     const cells = (await Promise.all([
         getCells({
-            script: botAccount.lockScript,
+            script: account.lockScript,
             scriptType: "lock",
             scriptSearchMode: "exact"
         }),
@@ -183,26 +248,22 @@ async function siftCells(
             scriptSearchMode: "exact"
         }),
         getCells({
-            script: limitOrderInfo.limitOrderLock,
+            script: ownedOwnerScript(),
+            scriptType: "lock",
+            scriptSearchMode: "exact"
+        }),
+        getCells({
+            script: limitOrderScript(),
             scriptType: "lock",
             scriptSearchMode: "prefix"
         })
     ])).flat();
 
-    const { capacities, notCapacities } = capacitySifter(cells, botAccount.expander);
-    const {
-        sudts,
-        receiptGroups,
-        ickbDepositPool,
-        notIckbs
-    } = await myIckbSifter(notCapacities, botAccount.expander);
-    const { ckb2SudtOrders, sudt2ckbOrders } = limitOrderInfo.sifter(notIckbs, undefined, "asc");
+    const { notCapacities, ...cells0 } = capacitySifter(cells, account.expander);
+    const { notIckbs, ...cells1 } = await myIckbSifter(notCapacities, account.expander);
+    const { notOrders, ...cells2 } = orderSifter(notIckbs, account.expander);
 
-    return {
-        capacities,
-        sudts, receiptGroups, ickbDepositPool,
-        ckb2SudtOrders, sudt2ckbOrders
-    }
+    return { ...cells0, ...cells1, ...cells2 };
 }
 
 function rebalanceAndFund(
@@ -211,22 +272,22 @@ function rebalanceAndFund(
     ickbDepositPool: readonly I8Cell[],
     tipHeader: I8Header,
     accountLock: I8Script
-) {
+): TransactionSkeletonType | undefined {
     //Balance should be after the current transaction, so it should account for transaction cells
     const a = Object.freeze(//after Tx Balances
         Object.fromEntries(
-            Object.entries(assets).map(([name, { balance, availableBalance, getDelta }]) => {
+            Object.entries(assets).map(([name, { estimated, estimatedAvailable, getDelta }]) => {
                 const delta = getDelta(tx);
                 return [name, Object.freeze({
-                    balance: balance.add(delta),
-                    availableBalance: availableBalance.add(delta)
+                    estimated: estimated + delta,
+                    estimatedAvailable: estimatedAvailable + delta
                 })];
             })
         )
     );
 
-    for (const [_, { availableBalance }] of Object.entries(a)) {
-        if (availableBalance.lt(0)) {
+    for (const [_, { estimatedAvailable }] of Object.entries(a)) {
+        if (estimatedAvailable < 0n) {
             return undefined;
         }
     }
@@ -242,27 +303,29 @@ function rebalanceAndFund(
 
     //Keep most balance in SUDT
     //Ideally keep a CKB balance between one and three deposits, with two deposits being the perfect spot
-    const ckbBalance = a["CKB"].balance;
+    const ckbBalance = a[ckbMark].estimated;
     const softCapPerDeposit = ckbSoftCapPerDeposit(tipHeader);
     let shouldSetApartEmergencyCKB = true;
     if (daoLimit <= 0) {
         //Do nothing...
-    } else if (ckbBalance.lt(softCapPerDeposit.mul(2))) {
-        const maxWithdrawAmount = ckb2Ickb(softCapPerDeposit.mul(2).sub(ckbBalance), tipHeader);
-        const new_tx = ickbRequestWithdrawalWith(tx, ickbDepositPool, tipHeader, maxWithdrawAmount, daoLimit, minLock, maxLock);
+    } else if (ckbBalance < softCapPerDeposit * 2n) {
+        const maxWithdrawAmount = ckb2Ickb(softCapPerDeposit * 2n - ckbBalance, tipHeader);
+        const new_tx = ickbRequestWithdrawalWith(
+            tx, ickbDepositPool, tipHeader, maxWithdrawAmount, daoLimit, minLock, maxLock
+        );
         if (new_tx.inputs.size != tx.inputs.size) {
             shouldSetApartEmergencyCKB = false;
         }
         tx = new_tx;
-    } else if (ckbBalance.gt(softCapPerDeposit.mul(3))) {
-        const deposits = ckbBalance.div(softCapPerDeposit).sub(2).toNumber();
+    } else if (ckbBalance > softCapPerDeposit * 3n) {
+        const deposits = Number(ckbBalance / softCapPerDeposit) - 2;
         tx = ickbDeposit(tx, deposits < daoLimit ? deposits : daoLimit, tipHeader);
     }
 
 
     // //Keep most balance in CKB
     // //Ideally keep a SUDT balance between one and three deposits, with two deposits being the perfect spot
-    // const ickbBalance = a["ICKB_SUDT"].balance;
+    // const ickbBalance = a[ickbMark].estimated;
     // if (daoLimit <= 0) {
     //     //Do nothing...
     // } else if (ickbBalance.lt(ICKB_SOFT_CAP_PER_DEPOSIT)) {
@@ -293,7 +356,7 @@ function rebalanceAndFund(
 }
 
 function setApartEmergencyCKB(tx: TransactionSkeletonType, accountLock: I8Script) {
-    let c = I8Cell.from({ lock: accountLock, capacity: parseUnit("1000", "ckb").toHexString() });
+    let c = I8Cell.from({ lock: accountLock, capacity: hex(1000n * CKB) });
     return addCells(tx, "append", [], [c]);
 }
 
@@ -349,5 +412,35 @@ async function myIckbSifter(inputs: readonly Cell[], accountLockExpander: (c: Ce
 
     throw Error("Unable to get some headers");
 }
+
+// function withdrawEverything(
+//     assets: Assets,
+//     ickbDepositPool: readonly I8Cell[],
+//     tipHeader: I8Header
+// ) {
+//     // For simplicity a transaction containing Nervos DAO script is currently limited to 64 output cells
+//     // so that processing is simplified, this limitation may be relaxed in a future Nervos DAO script update.
+//     //58 = 64 - 6, 6 are the estimated change cells added later
+//     let tx = TransactionSkeleton();
+//     const daoLimit = 58;
+//     const maxWithdrawAmount = assets[ickbMark].estimatedAvailable;
+//     tx = ickbRequestWithdrawalWith(tx, ickbDepositPool, tipHeader, maxWithdrawAmount, daoLimit);
+
+//     try {
+//         tx = fund(tx, assets, true);
+//     } catch (e: any) {
+//         if (e && (e.message === errorNotEnoughFunds || e.message === errorTooManyOutputs)) {
+//             return undefined;
+//         }
+//         throw e;
+//     }
+
+//     // Check if the transaction is doing anything useful
+//     if ([...tx.inputs, ...tx.outputs].some(isDao)) {
+//         return tx;
+//     }
+
+//     return undefined;
+// }
 
 main();

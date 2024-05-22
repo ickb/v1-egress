@@ -17,7 +17,7 @@ cd v1-bot
 3. Install dependencies:
 
 ```bash
-npm i
+pnpm i
 ```
 
 4. Define a `env/testnet/.env` file, for example:
@@ -25,6 +25,7 @@ npm i
 ```
 CHAIN=testnet
 BOT_PRIVATE_KEY=0x-YOUR-SECP256K1-BLAKE160-PRIVATE-KEY
+BOT_SLEEP_INTERVAL=60
 ```
 
 Optionally the property `RPC_URL` can also be specified:
@@ -36,7 +37,8 @@ RPC_URL=http://127.0.0.1:8114/
 5. Start matching user limit orders:
 
 ```bash
-npm run start --chain=testnet
+export CHAIN=testnet;
+pnpm run start;
 ```
 
 ## Licensing
