@@ -1,17 +1,17 @@
-# iCKB v1 bot
+# iCKB v1 egress
 
-## Run the limit order fulfillment bot on testnet
+## Run the egress bot on testnet
 
 1. Download this repo in a folder of your choice:  
 
 ```bash
-git clone https://github.com/ickb/v1-bot.git
+git clone https://github.com/ickb/v1-egress.git
 ```
 
 2. Enter into the repo folder:
 
 ```bash
-cd v1-bot
+cd v1-egress
 ```
 
 3. Install dependencies:
@@ -30,8 +30,8 @@ pnpm build
 
 ```
 CHAIN=testnet
-BOT_PRIVATE_KEY=0x-YOUR-SECP256K1-BLAKE160-PRIVATE-KEY
-BOT_SLEEP_INTERVAL=60
+EGRESS_PRIVATE_KEY=0x-YOUR-SECP256K1-BLAKE160-PRIVATE-KEY
+EGRESS_SLEEP_INTERVAL=60
 ```
 
 Optionally the property `RPC_URL` can also be specified:
