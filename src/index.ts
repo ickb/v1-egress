@@ -15,6 +15,7 @@ import {
   addCkbChange,
   addWitnessPlaceholder,
   binarySearch,
+  calculateTxFee,
   capacitySifter,
   chainConfigFrom,
   ckbDelta,
@@ -26,6 +27,7 @@ import {
   max,
   shuffle,
   since,
+  txSize,
   type ChainConfig,
   type ConfigAdapter,
 } from "@ickb/lumos-utils";
@@ -103,12 +105,12 @@ async function main() {
         receipts,
         wrGroups: matureWrGroups,
       });
-      const availableCkbBalance = ckbDelta(baseTx, 0n, config);
+      const availableCkbBalance = ckbDelta(baseTx, config);
       const ickbUdtBalance = ickbDelta(baseTx, config);
       const unavailableFunds = base({
         wrGroups: notMatureWrGroups,
       });
-      const unavailableCkbBalance = ckbDelta(unavailableFunds, 0n, config);
+      const unavailableCkbBalance = ckbDelta(unavailableFunds, config);
       const ckbBalance = availableCkbBalance + unavailableCkbBalance;
 
       executionLog.balance = {
@@ -128,6 +130,8 @@ async function main() {
         },
       };
       executionLog.ratio = ickbExchangeRatio(tipHeader);
+
+      // console.log(JSON.stringify(executionLog, replacer, " "));
 
       if (
         ickbUdtBalance === 0n &&
@@ -166,7 +170,7 @@ async function main() {
           withdrawals,
         };
         executionLog.txFee = {
-          fee: fmtCkb(ckbDelta(tx, 0n, config)),
+          fee: fmtCkb(ckbDelta(tx, config)),
           feeRate,
         };
 
@@ -324,8 +328,15 @@ function addChange(
   ({ tx, freeCkb } = addCkbChange(
     tx,
     accountLock,
-    feeRate,
-    addPlaceholders,
+    (txWithDummyChange: TransactionSkeletonType) => {
+      const baseFee = calculateTxFee(
+        txSize(addPlaceholders(txWithDummyChange)),
+        feeRate,
+      );
+      // Use a fee that is multiple of N=1249
+      const N = 1249n;
+      return ((baseFee + (N - 1n)) / N) * N;
+    },
     config,
   ));
 
@@ -517,7 +528,7 @@ function secp256k1Blake160(privateKey: string, config: ConfigAdapter) {
     args: key.publicKeyToBlake160(publicKey),
   });
 
-  const address = encodeToAddress(lockScript);
+  const address = encodeToAddress(lockScript, { config });
 
   const expander = lockExpanderFrom(lockScript);
 
@@ -526,6 +537,7 @@ function secp256k1Blake160(privateKey: string, config: ConfigAdapter) {
   }
 
   function signer(tx: TransactionSkeletonType) {
+    tx = preSigner(tx);
     tx = prepareSigningEntries(tx, { config });
     const message = tx.get("signingEntries").get(0)!.message; //How to improve in case of multiple locks?
     const sig = key.signRecoverable(message!, privateKey);
